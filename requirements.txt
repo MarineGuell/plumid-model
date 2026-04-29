@@ -1,7 +1,22 @@
+# =====================================================================
+# PlumID model service — Python dependencies
+# ---------------------------------------------------------------------
+# Torch CPU is pulled from the dedicated PyTorch wheel index. The line
+# below tells pip to *also* look there. The CPU-only build is ~200 MB
+# instead of ~2 GB for the CUDA build — and Railway containers don't
+# have GPUs anyway.
+# =====================================================================
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # --- Service / FastAPI
 fastapi==0.110.1
 uvicorn[standard]==0.30.6
 python-multipart>=0.0.9
+
+# --- Inference (CPU-only)
+torch==2.4.1
+torchvision==0.19.1
+huggingface_hub>=0.26,<1.0
 
 # --- Core scientific computing
 numpy>=1.21.0,<2.0.0

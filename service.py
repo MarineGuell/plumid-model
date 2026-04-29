@@ -2,21 +2,20 @@
 service.py — Plum'ID model microservice
 =========================================
 
-FastAPI wrapper around the preprocessing / inference pipeline. Designed
+FastAPI wrapper around the preprocessing + inference pipeline. Designed
 to run as a long-lived container on Railway alongside the API.
 
 Endpoints
 ---------
-* GET  /health        — liveness probe.
+* GET  /health        — fast liveness probe (always 200 once uvicorn is up).
+* GET  /model/status  — introspection: is the classifier loaded? which
+                        architecture? how many classes? cache info.
 * POST /preprocess    — multipart upload of an image; returns the
                         preprocessed PNG (segmented, denoised, contrast-
-                        enhanced, padded to 224×224).
-* POST /predict       — multipart upload; returns a JSON prediction. As
-                        no trained classifier is bundled in this repo
-                        yet, the response is a clearly-labelled stub
-                        (random species pick) so the API contract can be
-                        wired end-to-end. Replace the stub block once a
-                        real model is trained.
+                        enhanced, padded to MODEL_INPUT_SIZE × …).
+* POST /predict       — multipart upload; returns a JSON prediction by
+                        running the trained model downloaded from
+                        HuggingFace (env: HF_REPO_ID).
 * POST /augment       — kept for parity with the CLI: takes a folder of
                         already-preprocessed images mounted into the
                         container and produces N augmented variants.
@@ -27,24 +26,33 @@ Run
 ---
     uvicorn service:app --host 0.0.0.0 --port 8001
 
-Environment variables
----------------------
+Environment variables (see also `inference.classifier`)
+-------------------------------------------------------
     LOG_LEVEL              INFO | DEBUG | WARNING | ERROR
-    MODEL_PREDICT_TIMEOUT  Reserved for future use (real inference).
-    PORT                   Honoured by the container CMD (Railway sets it).
+    HF_REPO_ID             Required. e.g. "Azerty112/Plum_ID_V1"
+    HF_MODEL_FILENAME      Optional. Specific .pth file inside the repo.
+    HF_REVISION            Optional. Git ref, defaults to "main".
+    HF_TOKEN               Optional. Required for private repos.
+    PRELOAD_MODEL          0 | 1 (default 1). Load the model on startup
+                           in a background thread so the first /predict
+                           is fast.
+    PORT                   Honoured by the container CMD.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import random
+import threading
 import time
-from typing import Any, Dict, Optional
+from dataclasses import asdict
+from typing import Any, Dict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from data_preprocessing.single_image import encode_png, preprocess_bytes
+from inference import ClassifierError, get_classifier
 
 # --------------------------------------------------------------------- #
 # Logging                                                                #
@@ -63,10 +71,11 @@ log = logging.getLogger("plumid-model")
 
 app = FastAPI(
     title="Plum'ID — Model service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Image preprocessing + (stub) inference microservice for the "
-        "Plum'ID feather-identification stack."
+        "Image preprocessing + inference microservice for the Plum'ID "
+        "feather-identification stack. The classifier is downloaded from "
+        "HuggingFace at first use (or eagerly at startup if PRELOAD_MODEL=1)."
     ),
 )
 
@@ -74,21 +83,35 @@ app = FastAPI(
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10_000_000))
 
 
-# Stub list — replaced by a trained classifier once available.
-# Mirrors the species seeded in db/initdb/01-schema.sql.
-STUB_SPECIES = [
-    "Pie bavarde (Pica pica)",
-    "Pic épeiche (Dendrocopos major)",
-    "Perruche à collier (Psittacula krameri)",
-    "Geai des chênes (Garrulus glandarius)",
-    "Corneille noire (Corvus corone)",
-    "Canard colvert (Anas platyrhynchos)",
-]
+# --------------------------------------------------------------------- #
+# Startup: optionally preload the model in a background thread so the   #
+# server can answer /health immediately while the weights download.     #
+# --------------------------------------------------------------------- #
+
+
+def _preload_model_in_background() -> None:
+    def _runner() -> None:
+        try:
+            log.info("Preloading classifier in background…")
+            get_classifier().ensure_loaded()
+            log.info("Classifier preload OK")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Classifier preload FAILED: %s", exc)
+    threading.Thread(target=_runner, name="classifier-preload", daemon=True).start()
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    if os.environ.get("PRELOAD_MODEL", "1") not in {"0", "false", "False"}:
+        _preload_model_in_background()
+    else:
+        log.info("PRELOAD_MODEL disabled; the model will load on first /predict")
 
 
 # --------------------------------------------------------------------- #
 # Helpers                                                                #
 # --------------------------------------------------------------------- #
+
 
 async def _read_upload(file: UploadFile) -> bytes:
     """Read & validate an UploadFile, enforcing the size cap."""
@@ -109,10 +132,23 @@ async def _read_upload(file: UploadFile) -> bytes:
 # Routes                                                                 #
 # --------------------------------------------------------------------- #
 
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    """Liveness probe used by Railway / docker compose healthchecks."""
+    """
+    Liveness probe used by Railway / docker compose healthchecks.
+
+    Stays 200 even while the model is still downloading — the readiness
+    of the classifier is reported separately via /model/status, so a
+    slow first download doesn't cause the container to be killed.
+    """
     return {"status": "ok", "service": "plumid-model", "version": app.version}
+
+
+@app.get("/model/status")
+def model_status() -> Dict[str, Any]:
+    """Introspect the loaded classifier (or its load error)."""
+    return asdict(get_classifier().status)
 
 
 @app.post("/preprocess")
@@ -171,71 +207,65 @@ async def predict_endpoint(file: UploadFile = File(...)) -> JSONResponse:
     """
     Predict the bird species from a feather image.
 
-    The request flow is:
+    Pipeline:
         1. Decode the upload.
-        2. Run the preprocessing pipeline (segmentation + denoise +
-           contrast + padding/resize to 224×224).
-        3. Hand the tensor to a classifier.
+        2. Preprocess (segmentation + denoise + contrast + 224×224 pad).
+        3. Run the classifier downloaded from HuggingFace.
 
-    Steps 1–2 are real. Step 3 is a **placeholder** that returns a
-    random pick from the seeded species list, plus a clear
-    `model: "stub"` flag in the response. Wire a real model in here
-    once one is trained — keep the response shape stable.
+    Returns a JSON response with the top species, the top-3 candidates,
+    preprocessing metadata, and timing info. If the classifier failed
+    to load, returns 503 with a clear error explaining what to do.
     """
     content = await _read_upload(file)
 
     t0 = time.perf_counter()
     try:
-        _, info = preprocess_bytes(content, target_size=224)
+        clf = get_classifier()
+        # The classifier wants to know its expected input size; we let it
+        # handle that internally (`predict` resizes if needed). We use 224
+        # here because that's also what the trained network expects.
+        target_size = clf.status.input_size or int(
+            os.environ.get("MODEL_INPUT_SIZE", "224")
+        )
+        rgb, info = preprocess_bytes(content, target_size=target_size)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         log.exception("Predict preprocessing failed")
         raise HTTPException(status_code=500, detail=f"Preprocessing failed: {exc}") from exc
 
-    # ----------------------------------------------------------------- #
-    # >>> Replace this block with a real inference call. <<<            #
-    # e.g. `probs = model.predict(tensor)` ; `idx = probs.argmax()`     #
-    # then map idx -> species name and copy `probs.tolist()` into       #
-    # the `confidences` field.                                          #
-    # ----------------------------------------------------------------- #
-    rng = random.Random()
-    rng.seed(hash(content) & 0xFFFFFFFF)
-    pick = rng.choice(STUB_SPECIES)
-    confidences = sorted(
-        ((sp, rng.random()) for sp in STUB_SPECIES),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    # Force the picked species on top
-    confidences = [(pick, max(c for _, c in confidences) + 0.05)] + [
-        c for c in confidences if c[0] != pick
-    ]
-    total = sum(c for _, c in confidences)
-    confidences = [(name, round(c / total, 4)) for name, c in confidences]
+    # Inference can be slow (esp. first call). Run it on a worker
+    # thread so we don't block the asyncio event loop.
+    try:
+        prediction = await asyncio.to_thread(clf.predict, rgb)
+    except ClassifierError as exc:
+        log.error("Classifier not available: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Classifier not available: {exc}. "
+                "Check /model/status for details."
+            ),
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Inference failed")
+        raise HTTPException(
+            status_code=500, detail=f"Inference failed: {exc}"
+        ) from exc
 
     dt_ms = round((time.perf_counter() - t0) * 1000, 1)
     log.info(
-        "predict: filename=%s bytes=%d species=%s latency_ms=%s",
+        "predict: filename=%s bytes=%d species=%s confidence=%.3f latency_ms=%s",
         file.filename,
         len(content),
-        pick,
+        prediction["species"],
+        prediction["confidence"],
         dt_ms,
     )
 
     return JSONResponse(
         {
-            "model": "stub",
-            "warning": (
-                "No trained classifier is bundled in this build. "
-                "Returning a deterministic stub prediction so the API "
-                "contract can be exercised end-to-end."
-            ),
-            "species": pick,
-            "confidence": confidences[0][1],
-            "top_k": [
-                {"species": name, "confidence": conf} for name, conf in confidences[:3]
-            ],
+            **prediction,
             "preprocessing": info,
             "latency_ms": dt_ms,
         }
