@@ -1,50 +1,34 @@
-# =====================================================================
-# PlumID — Model microservice
-# ---------------------------------------------------------------------
-# Wraps the preprocessing + (stub) inference pipeline behind a FastAPI
-# server. Listens on $PORT (default 8001).
-#
-# Build:
-#   docker build -t plumid-model:latest .
-#
-# Run:
-#   docker run --rm -p 8001:8001 plumid-model:latest
-#
-# Health: GET /health -> {"status":"ok",...}
-# =====================================================================
-
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PORT=8001
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-# OpenCV headless still needs libgomp + a couple of GL/X stubs at runtime
-# (fastNlMeansDenoisingColored uses OpenMP). build-essential is needed
-# by scikit-image / scipy wheels on slim images.
+# System deps:
+#   - curl                 → healthcheck
+#   - libgomp1             → OpenMP (cv2.fastNlMeansDenoisingColored)
+#   - libglib2.0-0         → opencv runtime
+#   - build-essential      → wheels for scipy / scikit-image on slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
         build-essential \
         libgomp1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps first for layer caching.
-COPY requirements.txt ./requirements.txt
-RUN pip install --upgrade pip && pip install -r requirements.txt
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Copy source.
 COPY . /app
-
-# Make sure the entrypoint is executable.
-RUN chmod +x /app/entrypoint.sh
-
-# Drop privileges.
-RUN useradd -m appuser && chown -R appuser:appuser /app
-USER appuser
+RUN chmod +x ./entrypoint.sh
 
 EXPOSE 8001
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -fsS http://localhost:8001/health || exit 1
+
+ENTRYPOINT ["./entrypoint.sh"]
+CMD ["sh", "-c", "uvicorn service:app --host 0.0.0.0 --port ${PORT:-8001}"]

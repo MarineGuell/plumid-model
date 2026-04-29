@@ -1,13 +1,15 @@
 #!/bin/sh
-# =====================================================================
-# PlumID model — runtime entrypoint
-# ---------------------------------------------------------------------
-# Resolves the listening port from $PORT (Railway / Heroku style),
-# falling back to 8001.
-# =====================================================================
+# PlumID model entrypoint
+# ------------------------------------------------------------------
+# No DB, no migrations. Just announces the port and execs the
+# requested command. Mirrors the Poireaut entrypoint shape.
 set -e
 
-PORT="${PORT:-8001}"
+echo "⟡ PlumID model starting…"
 
-echo "[plumid-model] starting uvicorn on 0.0.0.0:${PORT}"
-exec python -m uvicorn service:app --host 0.0.0.0 --port "${PORT}"
+if [ -n "$PORT" ]; then
+    echo "⟡ Binding to PORT=$PORT"
+fi
+
+echo "⟡ Handing off to: $*"
+exec "$@"
