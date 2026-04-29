@@ -38,10 +38,13 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 # Copy source.
 COPY . /app
 
+# Make sure the entrypoint is executable.
+RUN chmod +x /app/entrypoint.sh
+
 # Drop privileges.
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8001
 
-CMD ["sh", "-c", "uvicorn service:app --host 0.0.0.0 --port ${PORT:-8001}"]
+ENTRYPOINT ["/app/entrypoint.sh"]
