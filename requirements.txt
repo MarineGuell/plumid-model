@@ -1,14 +1,20 @@
-# Core scientific computing
-numpy>=1.21.0
+# --- Service / FastAPI
+fastapi==0.110.1
+uvicorn[standard]==0.30.6
+python-multipart>=0.0.9
+
+# --- Core scientific computing
+numpy>=1.21.0,<2.0.0
 scipy>=1.7.0
 
-# Image processing
-opencv-python>=4.5.0
+# --- Image processing
+opencv-python-headless>=4.5.0
 scikit-image>=0.18.0
 Pillow>=8.3.0
 
-# Testing & Utilities
+# --- Testing & utilities
+pytest>=8.3
 mock>=4.0.0
 
-# Python version requirement
-# Requires: Python 3.8 or higher
+# --- Python version requirement
+# Requires: Python 3.9 or higher

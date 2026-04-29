@@ -1,159 +1,152 @@
-# Image Dataset Preprocessing & Augmentation Pipeline
+# Plum'ID — Model service
 
-Pipeline Python pour préparer et augmenter un dataset d'images destiné à l'entraînement de modèles de Deep Learning.
+Image preprocessing + (stub) inference microservice for the Plum'ID
+feather-identification stack. Runs as a long-lived FastAPI container
+and is called by `plumid-api` over the internal network.
 
-## Fonctionnalités
+The repository keeps both modes available:
 
-Le projet se compose de deux étapes enchaînées automatiquement :
+* **CLI** (`pipeline.py`) — original batch tool that walks a folder,
+  preprocesses every image, and runs data augmentation. Useful for
+  building a training set.
+* **HTTP service** (`service.py`) — the new entry point used in
+  production. Same preprocessing chain, single-image, in-memory.
 
-### Étape 1 — Prétraitement des images (Data Preprocessing)
+---
 
-| Opération | Description |
-|---|---|
-| **Segmentation (SAM)** | Détection et extraction automatique des objets via le modèle SAM (Segment Anything Model) |
-| **Débruitage** | Suppression du bruit avec `cv2.fastNlMeansDenoisingColored` |
-| **Amélioration du contraste** | Égalisation adaptative (CLAHE) sur le canal L en espace LAB |
-| **Netteté (Sharpening)** | Filtre de netteté par convolution |
-| **Padding & Redimensionnement** | Mise à l'échelle carrée (224×224) avec fond noir |
+## Pipeline stages (shared by CLI and service)
 
-### Étape 2 — Augmentation des données (Data Augmentation)
+| Stage              | What it does                                                            |
+| ------------------ | ----------------------------------------------------------------------- |
+| Segmentation       | Pulls the largest plausible feather-shaped object out of the image. Uses adaptive threshold + watershed, with a contour-detection fallback. |
+| Denoising          | `cv2.fastNlMeansDenoisingColored`                                        |
+| Contrast           | CLAHE on the L channel (LAB color space)                                |
+| Padding & resize   | Square pad with black background, then resize to 224×224                |
+| Augmentation (CLI) | Rotate / blur / random noise / horizontal flip — see `augmentation_config.py` |
 
-Génération d'images augmentées à partir des images prétraitées :
+---
 
-- **Rotation** aléatoire (probabilité : 50 %, ±25°)
-- **Flou** (probabilité : 10 %)
-- **Bruit aléatoire** (probabilité : 50 %)
-- **Flip horizontal** (probabilité : 30 %)
-- **Flip vertical** (optionnel)
-
-Les probabilités et opérations sont configurables dans `augmentation_config.py`.
-
-## Prérequis
-
-- Python 3.8+
-- GPU compatible CUDA (recommandé pour SAM)
-- Poids du modèle SAM (`sam3.pt` par défaut)
-
-## Installation
+## HTTP service
 
 ```bash
-git clone <repo-url>
-cd py-image-dataset-generator
+# Build & run
+docker build -t plumid-model .
+docker run --rm -p 8001:8001 plumid-model
+
+# Or directly with Python
 pip install -r requirements.txt
+uvicorn service:app --host 0.0.0.0 --port 8001
 ```
 
-## Utilisation
+### Endpoints
 
-### Pipeline complète (preprocessing + augmentation)
+| Method | Path           | Purpose |
+| ------ | -------------- | ------- |
+| GET    | `/health`      | Liveness probe (used by Railway / docker compose). |
+| POST   | `/preprocess`  | Multipart upload (`file`); returns the preprocessed PNG. Optional form fields: `skip_segmentation` (bool), `target_size` (int, default 224). Metadata exposed via `X-PlumID-*` headers. |
+| POST   | `/predict`     | Multipart upload (`file`); returns a JSON prediction (currently a clearly-labelled stub — see below). |
+| POST   | `/augment`     | Batch job. Form fields: `input_dir`, `output_dir`, `limit`. Requires the directories to be visible inside the container (mount a volume). |
+
+### Why `/predict` returns a stub
+
+No trained classifier is bundled in this build. The endpoint runs the
+**real** preprocessing chain, then picks a species deterministically
+from the seeded list and tags the response with `model: "stub"` and a
+warning string. This lets the API contract be wired end-to-end so the
+mobile/web client and the rest of the stack can be tested without
+waiting for a model. To go live, replace the marked block in
+`service.py` with a real inference call — keep the response shape
+stable.
+
+### Example call
 
 ```bash
-python pipeline.py -input=path/to/raw/images -output=path/to/augmented -limit=500
+curl -F "file=@feather.jpg" http://localhost:8001/predict | jq
 ```
 
-### Paramètres
+```json
+{
+  "model": "stub",
+  "warning": "No trained classifier is bundled ...",
+  "species": "Pic épeiche (Dendrocopos major)",
+  "confidence": 0.2118,
+  "top_k": [
+    {"species": "Pic épeiche (Dendrocopos major)", "confidence": 0.2118},
+    {"species": "Geai des chênes (Garrulus glandarius)", "confidence": 0.1903},
+    {"species": "Corneille noire (Corvus corone)", "confidence": 0.1740}
+  ],
+  "preprocessing": {
+    "input_size": [1024, 768],
+    "segmented": true,
+    "target_size": 224,
+    "bbox_size": [410, 612]
+  },
+  "latency_ms": 412.7
+}
+```
 
-| Paramètre | Description |
-|---|---|
-| `-input`, `-i` **(requis)** | Dossier contenant les images brutes |
-| `-output`, `-o` | Dossier de destination pour les images augmentées (défaut : `output`) |
-| `-limit`, `-l` | Nombre d'images augmentées à générer (défaut : 500) |
-| `-sam_weights` | Chemin vers les poids SAM (défaut : `sam3.pt`) |
-| `--skip-preprocessing` | Sauter le prétraitement et lancer uniquement l'augmentation |
-| `--preprocess-only` | Lancer uniquement le prétraitement (pas d'augmentation) |
+---
 
-### Exemples
+## Railway deployment
 
-**Pipeline complète :**
+Deploy this repository as its own Railway service:
+
+1. **New service → Deploy from GitHub repo →** select `plumid-model`.
+2. Railway picks up `Dockerfile` automatically. The provided
+   `railway.json` sets `/health` as the healthcheck path.
+3. The service uses Railway's private networking — no public domain
+   is needed. The API reaches it at
+   `http://${{plumid-model.RAILWAY_PRIVATE_DOMAIN}}:$PORT`.
+4. (Optional) Set environment variables — see `.env.example`. The
+   defaults are safe for production.
+
+---
+
+## CLI mode (training-set generation)
+
+The original `pipeline.py` is still there:
+
 ```bash
-python pipeline.py -input=mes_images -output=dataset_augmente -limit=1000
+# Full pipeline (preprocess + augment)
+python pipeline.py -input=raw_images -output=augmented -limit=1000
+
+# Preprocessing only
+python pipeline.py -input=raw_images --preprocess-only
+
+# Augmentation only (assumes input is already preprocessed)
+python pipeline.py -input=preprocessed --skip-preprocessing -output=augmented -limit=2000
 ```
 
-**Prétraitement seul :**
-```bash
-python pipeline.py -input=mes_images --preprocess-only
-```
+Configurable knobs live in `augmentation_config.py`.
 
-**Augmentation seule** (sur des images déjà prétraitées) :
-```bash
-python pipeline.py -input=data_preprocessing/preprocessed/padding --skip-preprocessing -output=dataset_augmente -limit=2000
-```
+---
 
-### Augmentation seule (mode standalone)
-
-```bash
-python augmentation.py -folder=D:\Master 2 Expert IA\Ydays\Images_Plumes-Dataset\Images_Plumes\Geai_des_chene_Passiform_garulus_glandarius -limit=10000 -dest=dossier_sortie
-```
-
-### Pipeline personnalisée en Python
-
-```python
-from augmentation.augmentation import DatasetGenerator
-
-pipeline = DatasetGenerator(
-    folder_path="images/preprocessed/",
-    num_files=5000,
-    save_to_disk=True,
-    folder_destination="images/results"
-)
-pipeline.rotate(probability=0.5, max_left_degree=25, max_right_degree=25)
-pipeline.random_noise(probability=0.5)
-pipeline.blur(probability=0.5)
-pipeline.horizontal_flip(probability=0.2)
-pipeline.execute()
-```
-
-## Structure du projet
+## Repository layout
 
 ```
-├── pipeline.py                  # Point d'entrée principal (preprocessing → augmentation)
-├── augmentation.py              # Point d'entrée standalone pour l'augmentation
-├── augmentation_config.py       # Configuration des opérations d'augmentation
-├── requirements.txt             # Dépendances Python
+plumid-model/
+├── service.py                       # FastAPI service (HTTP entrypoint)
+├── pipeline.py                      # CLI batch tool (training-set generation)
+├── Dockerfile                       # service container image
+├── railway.json                     # Railway config
+├── requirements.txt
 ├── augmentation/
-│   ├── augmentation.py          # Classe DatasetGenerator
-│   └── operations.py            # Opérations d'augmentation (Rotate, Blur, Flip, etc.)
+│   ├── augmentation.py              # DatasetGenerator class
+│   └── operations.py                # Rotate / Blur / Flip / Noise
+├── augmentation_config.py
 ├── data_preprocessing/
-│   ├── datapreprocessing.py     # Pipeline de prétraitement (segmentation → padding)
-│   └── preprocessed/            # Sorties intermédiaires du prétraitement
-│       ├── segmentation/
-│       ├── denoise/
-│       ├── contrast/
-│       ├── sharpened/
-│       └── padding/
+│   ├── datapreprocessing.py         # disk-based pipeline (CLI)
+│   └── single_image.py              # in-memory pipeline (service)
 ├── utils/
-│   └── utils.py                 # Utilitaires (fichiers, barre de progression)
+│   └── utils.py                     # helpers (file I/O, progress bar)
 └── tests/
-    └── utils/
-        └── test_string_utils.py
 ```
 
-## Configuration
+---
 
-Modifiez `augmentation_config.py` pour ajuster les opérations d'augmentation :
+## Tests
 
-```python
-DEFAULT_OPERATIONS = [
-    'rotate',
-    'blur',
-    'random_noise',
-    'horizontal_flip',
-    # 'vertical_flip'
-]
-
-DEFAULT_ROTATE_PROBABILITY = 0.5
-DEFAULT_ROTATE_MAX_LEFT_DEGREE = 25
-DEFAULT_ROTATE_MAX_RIGHT_DEGREE = 25
-DEFAULT_BLUR_PROBABILITY = 0.1
-DEFAULT_RANDOM_NOISE_PROBABILITY = 0.5
-DEFAULT_HORIZONTAL_FLIP_PROBABILITY = 0.3
-DEFAULT_VERTICAL_FLIP_PROBABILITY = 0.3
+```bash
+pip install -r requirements.txt
+pytest -q
 ```
-
-## Dépendances
-
-- `scipy` — Calcul scientifique
-- `scikit-image` — Traitement d'images (IO, transformations)
-- `opencv-python` — Vision par ordinateur (débruitage, contours, etc.)
-- `numpy` — Manipulation de tableaux
-- `Pillow` — Manipulation d'images (padding, resize)
-- `ultralytics` — Modèle SAM pour la segmentation
