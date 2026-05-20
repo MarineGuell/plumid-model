@@ -63,25 +63,57 @@ curl -F "file=@feather.jpg" http://localhost:8001/predict | jq
 
 ```json
 {
+  "ok": true,
   "model": "real",
   "architecture": "resnet50",
-  "num_classes": 6,
-  "species": "Pic épeiche (Dendrocopos major)",
-  "confidence": 0.842,
+  "num_classes": 4,
+  "species_id": 4,
+  "species_name": "Geai des chênes (Garrulus glandarius)",
+  "model_class": "Geai_des_chene_Passiform_garulus_glandarius",
+  "confidence": 52.38,
   "top_k": [
-    {"species": "Pic épeiche (Dendrocopos major)", "confidence": 0.842},
-    {"species": "Geai des chênes (Garrulus glandarius)", "confidence": 0.107},
-    {"species": "Corneille noire (Corvus corone)", "confidence": 0.031}
+    {"species_id": 4, "species_name": "Geai des chênes (Garrulus glandarius)", "model_class": "Geai_des_chene_Passiform_garulus_glandarius", "confidence": 52.38},
+    {"species_id": 1, "species_name": "Pie bavarde (Pica pica)", "model_class": "Pie_bavarde_Pica_pica", "confidence": 40.44},
+    {"species_id": 3, "species_name": "Perruche à collier (Psittacula krameri)", "model_class": "Peruche_a_collier_Psittacula_krameri", "confidence": 7.18}
   ],
-  "preprocessing": {
-    "input_size": [1024, 768],
-    "segmented": true,
-    "target_size": 224,
-    "bbox_size": [410, 612]
-  },
   "latency_ms": 312.7
 }
 ```
+
+### Preprocessing warnings (HTTP 422)
+
+The pipeline handles three preprocessing outcomes:
+
+| `warning_code`           | What happened                                                       | When the app should react |
+| ------------------------ | ------------------------------------------------------------------- | ------------------------- |
+| *(none)*                 | Exactly one feather found → prediction returned.                    | Use `species_id`.         |
+| `NO_FEATHER`             | No object resembling a feather found in the image.                  | Show the `message` to the user (advice on framing). |
+| `TOO_MANY_FEATHERS`      | Multiple objects detected; the model confirmed several are feathers. | Show the `message` and ask for a new photo. |
+| `MULTIPLE_CANDIDATES` *(internal)* | Multiple candidates detected; service is asking the model to filter. | Never reaches the API — resolved internally into one of the above. |
+
+Example warning response:
+
+```json
+{
+  "ok": false,
+  "warning_code": "NO_FEATHER",
+  "message": "Aucune plume n'a été reconnue sur l'image. Veuillez reprendre la photo en suivant ces recommandations :\n• Utilisez un fond uni et contrasté (évitez les surfaces texturées)\n• Placez la plume à plat, seule, sans main visible\n• Cadrez pour que la plume occupe entre 30 % et 75 % de l'image",
+  "latency_ms": 421.3
+}
+```
+
+### Response fields
+
+| Field          | Type   | Description |
+| -------------- | ------ | ----------- |
+| `ok`           | bool   | `true` if a prediction was produced, `false` if preprocessing rejected the image. |
+| `species_id`   | int    | Primary key in the API's `species` table. **`0` = "Non identifié"**. |
+| `species_name` | string | Display name (matches `species.species_name` in the DB). |
+| `model_class`  | string | Raw label as emitted by the trained model. |
+| `confidence`   | float  | Confidence percent (0–100), rounded to 2 decimals. |
+| `top_k`        | list   | Top-3 candidates (same fields). |
+| `warning_code` | string | One of `NO_FEATHER`, `TOO_MANY_FEATHERS` when `ok=false`. |
+| `message`      | string | Human-readable explanation to show to the user. |
 
 ### Checking that the model loaded
 

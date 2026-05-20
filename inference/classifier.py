@@ -55,12 +55,10 @@ log = logging.getLogger("plumid-model.classifier")
 # ordering or set of classes.                                            #
 # --------------------------------------------------------------------- #
 DEFAULT_CLASS_NAMES: List[str] = [
-    "Pie bavarde (Pica pica)",
-    "Pic épeiche (Dendrocopos major)",
-    "Perruche à collier (Psittacula krameri)",
-    "Geai des chênes (Garrulus glandarius)",
-    "Corneille noire (Corvus corone)",
-    "Canard colvert (Anas platyrhynchos)",
+    "Geai_des_chene_Passiform_garulus_glandarius",
+    "Non_plumes",
+    "Pic_epeiche_Dendrocopos_major",
+    "Pie_bavarde_Pica_pica",
 ]
 
 
@@ -351,6 +349,8 @@ class Classifier:
     """
 
     def __init__(self) -> None:
+        from .species_map import SpeciesMapper
+
         self._lock = threading.Lock()
         self._loaded = False
         self._model = None
@@ -360,6 +360,7 @@ class Classifier:
         self._input_size: int = 224
         self._mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
         self._std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+        self._species_mapper = SpeciesMapper.from_env()
 
     # ----- public API ------------------------------------------------ #
 
@@ -387,7 +388,15 @@ class Classifier:
 
         Returns
         -------
-        dict with keys: species, confidence, top_k, num_classes, architecture.
+        dict with keys:
+            - model: "real"
+            - architecture: e.g. "resnet50"
+            - num_classes: total output classes
+            - species_id: int — primary key in the API's species table
+            - species_name: human-readable display name
+            - model_class: raw label as emitted by the trained network
+            - confidence: float in [0, 100] (percent), rounded to 2dp
+            - top_k: list of {species_id, species_name, model_class, confidence}
         """
         self.ensure_loaded()
         if self._model is None:
@@ -428,20 +437,94 @@ class Classifier:
 
         order = np.argsort(probs)[::-1]
         kk = min(top_k, len(self._class_names))
+
+        # Build top-k entries with both the model's raw class label and
+        # the resolved species record (id + display name).
+        top: List[Dict[str, Any]] = []
+        for idx in order[:kk]:
+            i = int(idx)
+            model_class = self._class_names[i]
+            ref = self._species_mapper.resolve(model_class)
+            top.append({
+                "species_id": ref.id,
+                "species_name": ref.display_name,
+                "model_class": ref.model_class,
+                "confidence": round(float(probs[i]) * 100.0, 2),
+            })
+
+        head = top[0]
         return {
-            "species": self._class_names[int(order[0])],
-            "confidence": float(probs[order[0]]),
-            "top_k": [
-                {
-                    "species": self._class_names[int(i)],
-                    "confidence": float(probs[int(i)]),
-                }
-                for i in order[:kk]
-            ],
-            "num_classes": len(self._class_names),
-            "architecture": self._status.architecture,
             "model": "real",
+            "architecture": self._status.architecture,
+            "num_classes": len(self._class_names),
+            "species_id": head["species_id"],
+            "species_name": head["species_name"],
+            "model_class": head["model_class"],
+            "confidence": head["confidence"],
+            "top_k": top,
         }
+
+    def predict_class_name(self, rgb_uint8: np.ndarray) -> str:
+        """
+        Lightweight version of predict() that only returns the top-1
+        model class name (e.g. "Geai_des_chene_Passiform_garulus_glandarius").
+
+        Used by the preprocessing pipeline when several feather
+        candidates are detected and we need to filter out the ones
+        the model labels as "Non_plumes" before settling on the
+        winning one.
+
+        Returns
+        -------
+        str — the raw model class label of the top prediction.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        self.ensure_loaded()
+        if self._model is None:
+            raise ClassifierError("Model failed to load; see /model/status")
+
+        if rgb_uint8.ndim != 3 or rgb_uint8.shape[2] != 3:
+            raise ClassifierError(
+                f"Expected an HxWx3 array, got shape {rgb_uint8.shape}"
+            )
+        if (
+            rgb_uint8.shape[0] != self._input_size
+            or rgb_uint8.shape[1] != self._input_size
+        ):
+            import cv2 as cv
+            rgb_uint8 = cv.resize(
+                rgb_uint8,
+                (self._input_size, self._input_size),
+                interpolation=cv.INTER_LANCZOS4,
+            )
+
+        arr = rgb_uint8.astype(np.float32) / 255.0
+        arr = (arr - np.array(self._mean, dtype=np.float32)) / np.array(
+            self._std, dtype=np.float32
+        )
+        arr = np.transpose(arr, (2, 0, 1))
+        tensor = torch.from_numpy(arr).unsqueeze(0).to(self._device)
+
+        with torch.no_grad():
+            logits = self._model(tensor)
+            probs = F.softmax(logits, dim=-1)[0].cpu().numpy()
+
+        top_idx = int(np.argmax(probs))
+        return self._class_names[top_idx]
+
+    def is_feather(self, image_bgr_or_rgb: np.ndarray) -> bool:
+        """
+        Return True if the model classifies the given image as a feather
+        (i.e. not the 'Non_plumes' class). Convenient helper for
+        `preprocess.resolve_candidates`.
+
+        Note: assumes the input is RGB. If you have BGR (from OpenCV),
+        convert first.
+        """
+        cls = self.predict_class_name(image_bgr_or_rgb)
+        return not self._species_mapper.is_non_plume(cls)
 
     # ----- internal -------------------------------------------------- #
 

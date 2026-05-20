@@ -2,25 +2,23 @@
 service.py — Plum'ID model microservice
 =========================================
 
-FastAPI wrapper around the preprocessing + inference pipeline. Designed
-to run as a long-lived container on Railway alongside the API.
+FastAPI wrapper around the preprocessing + inference pipeline.
 
 Endpoints
 ---------
-* GET  /health        — fast liveness probe (always 200 once uvicorn is up).
-* GET  /model/status  — introspection: is the classifier loaded? which
-                        architecture? how many classes? cache info.
-* POST /preprocess    — multipart upload of an image; returns the
-                        preprocessed PNG (segmented, denoised, contrast-
-                        enhanced, padded to MODEL_INPUT_SIZE × …).
-* POST /predict       — multipart upload; returns a JSON prediction by
-                        running the trained model downloaded from
-                        HuggingFace (env: HF_REPO_ID).
-* POST /augment       — kept for parity with the CLI: takes a folder of
-                        already-preprocessed images mounted into the
-                        container and produces N augmented variants.
-                        Useful for offline dataset generation jobs; not
-                        meant to be called from the public API.
+* GET  /health        — fast liveness probe.
+* GET  /model/status  — introspection on the loaded classifier.
+* POST /preprocess    — multipart upload; returns the preprocessed PNG
+                        (segmentation + denoise + contrast + 224×224).
+* POST /predict       — multipart upload; runs the full pipeline:
+                          1. preprocess.preprocess(image_bytes)
+                          2. If multiple candidates → ask the model which
+                             ones are feathers and pick.
+                          3. If 0 or 2+ remaining → 422 with a clear
+                             warning_code + user_message.
+                          4. Otherwise → run the classifier on the
+                             selected image and return the prediction.
+* POST /augment       — batch dataset augmentation job (offline).
 
 Run
 ---
@@ -30,13 +28,10 @@ Environment variables (see also `inference.classifier`)
 -------------------------------------------------------
     LOG_LEVEL              INFO | DEBUG | WARNING | ERROR
     HF_REPO_ID             Required. e.g. "Azerty112/Plum_ID_V1"
-    HF_MODEL_FILENAME      Optional. Specific .pth file inside the repo.
+    HF_MODEL_FILENAME      Optional. Specific .pth file in the repo.
     HF_REVISION            Optional. Git ref, defaults to "main".
     HF_TOKEN               Optional. Required for private repos.
-    PRELOAD_MODEL          0 | 1 (default 1). Load the model on startup
-                           in a background thread so the first /predict
-                           is fast.
-    PORT                   Honoured by the container CMD.
+    PRELOAD_MODEL          0 | 1 (default 1).
 """
 from __future__ import annotations
 
@@ -46,13 +41,24 @@ import os
 import threading
 import time
 from dataclasses import asdict
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+import cv2 as cv
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
+from PIL import Image
+import io
 
-from data_preprocessing.single_image import encode_png, preprocess_bytes
 from inference import ClassifierError, get_classifier
+from preprocess import (
+    PreprocessResult,
+    WARNING_MULTIPLE_CANDIDATES,
+    WARNING_NO_FEATHER,
+    WARNING_TOO_MANY_FEATHERS,
+    preprocess,
+    resolve_candidates,
+)
 
 # --------------------------------------------------------------------- #
 # Logging                                                                #
@@ -71,23 +77,46 @@ log = logging.getLogger("plumid-model")
 
 app = FastAPI(
     title="Plum'ID — Model service",
-    version="1.1.0",
+    version="1.2.0",
     description=(
-        "Image preprocessing + inference microservice for the Plum'ID "
-        "feather-identification stack. The classifier is downloaded from "
-        "HuggingFace at first use (or eagerly at startup if PRELOAD_MODEL=1)."
+        "Image preprocessing + inference microservice. Handles multi-feather "
+        "images by running each candidate through the classifier and "
+        "filtering out the 'Non_plumes' false positives."
     ),
 )
 
-# Tuning knob: maximum upload size in bytes (10 MB by default).
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10_000_000))
 
 
 # --------------------------------------------------------------------- #
-# Startup: optionally preload the model in a background thread so the   #
-# server can answer /health immediately while the weights download.     #
+# Helpers                                                                #
 # --------------------------------------------------------------------- #
 
+def _bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
+    return cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
+
+
+def _encode_png_bgr(img_bgr: np.ndarray) -> bytes:
+    """Encode a BGR ndarray to PNG bytes (for the /preprocess response)."""
+    rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb, mode="RGB")
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _warning_body(result: PreprocessResult) -> Dict[str, Any]:
+    """Build the JSON body for a preprocessing warning response."""
+    return {
+        "ok": False,
+        "warning_code": result.warning_code,
+        "message": result.user_message,
+    }
+
+
+# --------------------------------------------------------------------- #
+# Startup                                                                #
+# --------------------------------------------------------------------- #
 
 def _preload_model_in_background() -> None:
     def _runner() -> None:
@@ -105,16 +134,14 @@ def _on_startup() -> None:
     if os.environ.get("PRELOAD_MODEL", "1") not in {"0", "false", "False"}:
         _preload_model_in_background()
     else:
-        log.info("PRELOAD_MODEL disabled; the model will load on first /predict")
+        log.info("PRELOAD_MODEL disabled; model will load on first /predict")
 
 
 # --------------------------------------------------------------------- #
-# Helpers                                                                #
+# Upload helpers                                                         #
 # --------------------------------------------------------------------- #
-
 
 async def _read_upload(file: UploadFile) -> bytes:
-    """Read & validate an UploadFile, enforcing the size cap."""
     if file is None:
         raise HTTPException(status_code=400, detail="Missing 'file' field")
     content = await file.read()
@@ -135,108 +162,155 @@ async def _read_upload(file: UploadFile) -> bytes:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    """
-    Liveness probe used by Railway / docker compose healthchecks.
-
-    Stays 200 even while the model is still downloading — the readiness
-    of the classifier is reported separately via /model/status, so a
-    slow first download doesn't cause the container to be killed.
-    """
     return {"status": "ok", "service": "plumid-model", "version": app.version}
 
 
 @app.get("/model/status")
 def model_status() -> Dict[str, Any]:
-    """Introspect the loaded classifier (or its load error)."""
     return asdict(get_classifier().status)
 
 
 @app.post("/preprocess")
-async def preprocess_endpoint(
-    file: UploadFile = File(...),
-    skip_segmentation: bool = Form(False),
-    target_size: int = Form(224),
-):
+async def preprocess_endpoint(file: UploadFile = File(...)):
     """
-    Run the preprocessing pipeline on a single image.
+    Run only the preprocessing pipeline on a single image (no inference).
 
     Returns
     -------
-    image/png — the preprocessed image (target_size × target_size).
-                Metadata about the run is exposed in response headers
-                (`X-PlumID-Segmented`, `X-PlumID-Input-Size`, …).
+    image/png — the preprocessed image when exactly one feather is found.
+    application/json — when 0 or N candidates are found, with the
+                       appropriate warning_code and user_message.
     """
     content = await _read_upload(file)
-    if target_size <= 0 or target_size > 1024:
-        raise HTTPException(status_code=400, detail="target_size out of range")
 
     t0 = time.perf_counter()
     try:
-        rgb, info = preprocess_bytes(
-            content,
-            target_size=target_size,
-            skip_segmentation=skip_segmentation,
-        )
+        result = preprocess(content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         log.exception("Preprocessing failed")
         raise HTTPException(status_code=500, detail=f"Preprocessing failed: {exc}") from exc
 
-    png = encode_png(rgb)
     dt_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    headers = {
-        "X-PlumID-Segmented": "1" if info.get("segmented") else "0",
-        "X-PlumID-Input-Size": "x".join(map(str, info.get("input_size", []))),
-        "X-PlumID-Target-Size": str(info.get("target_size", target_size)),
-        "X-PlumID-Latency-Ms": str(dt_ms),
-    }
+    if not result.ok:
+        # Cas 0 plume ou N plumes (sans résolution par le modèle).
+        log.info(
+            "preprocess: filename=%s bytes=%d warning=%s latency_ms=%s",
+            file.filename, len(content), result.warning_code, dt_ms,
+        )
+        return JSONResponse(
+            status_code=result.status_code,
+            content={
+                **_warning_body(result),
+                "candidates_count": (
+                    len(result.candidates) if result.candidates else 0
+                ),
+                "latency_ms": dt_ms,
+            },
+        )
+
+    png = _encode_png_bgr(result.image)
+    headers = {"X-PlumID-Latency-Ms": str(dt_ms)}
     log.info(
-        "preprocess: filename=%s bytes=%d segmented=%s latency_ms=%s",
-        file.filename,
-        len(content),
-        info.get("segmented"),
-        dt_ms,
+        "preprocess: filename=%s bytes=%d ok latency_ms=%s",
+        file.filename, len(content), dt_ms,
     )
     return Response(content=png, media_type="image/png", headers=headers)
+
+
+def _resolve_with_classifier(result: PreprocessResult, clf) -> PreprocessResult:
+    """
+    Glue between preprocess.resolve_candidates and the classifier.
+
+    The `is_feather_fn` callback runs the model on each BGR candidate
+    image (224×224) and returns True for candidates the model recognises
+    as a feather (i.e. not 'Non_plumes').
+    """
+    def _is_feather(img_bgr: np.ndarray) -> bool:
+        rgb = _bgr_to_rgb(img_bgr)
+        try:
+            return clf.is_feather(rgb)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("is_feather check failed (%s); treating as non-feather", exc)
+            return False
+
+    return resolve_candidates(result, is_feather_fn=_is_feather)
 
 
 @app.post("/predict")
 async def predict_endpoint(file: UploadFile = File(...)) -> JSONResponse:
     """
-    Predict the bird species from a feather image.
+    Full pipeline: preprocess → (resolve multi-candidates) → predict.
 
-    Pipeline:
-        1. Decode the upload.
-        2. Preprocess (segmentation + denoise + contrast + 224×224 pad).
-        3. Run the classifier downloaded from HuggingFace.
-
-    Returns a JSON response with the top species, the top-3 candidates,
-    preprocessing metadata, and timing info. If the classifier failed
-    to load, returns 503 with a clear error explaining what to do.
+    Possible outcomes
+    -----------------
+    200 — preprocessing OK and inference succeeded.
+    422 — preprocessing failed with one of:
+            WARNING_NO_FEATHER       (no recognisable feather in the image)
+            WARNING_TOO_MANY_FEATHERS (multiple feathers detected by the model)
+    400 — invalid image bytes.
+    503 — classifier not loaded yet / failed to load.
+    500 — unexpected failure.
     """
     content = await _read_upload(file)
-
     t0 = time.perf_counter()
+
+    # ------------- 1. Preprocess --------------------------------------- #
     try:
-        clf = get_classifier()
-        # The classifier wants to know its expected input size; we let it
-        # handle that internally (`predict` resizes if needed). We use 224
-        # here because that's also what the trained network expects.
-        target_size = clf.status.input_size or int(
-            os.environ.get("MODEL_INPUT_SIZE", "224")
-        )
-        rgb, info = preprocess_bytes(content, target_size=target_size)
+        result = preprocess(content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         log.exception("Predict preprocessing failed")
         raise HTTPException(status_code=500, detail=f"Preprocessing failed: {exc}") from exc
 
-    # Inference can be slow (esp. first call). Run it on a worker
-    # thread so we don't block the asyncio event loop.
+    # ------------- 2. Multi-candidate resolution (if needed) ----------- #
+    if result.warning_code == WARNING_MULTIPLE_CANDIDATES:
+        try:
+            clf = get_classifier()
+            # Ensure model is loaded so the candidate filter has something
+            # to work with. Done in a worker thread to keep the event loop free.
+            await asyncio.to_thread(clf.ensure_loaded)
+            result = await asyncio.to_thread(
+                _resolve_with_classifier, result, clf
+            )
+        except ClassifierError as exc:
+            log.error("Classifier not available for candidate resolution: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Classifier not available: {exc}. "
+                    "Check /model/status for details."
+                ),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Candidate resolution failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Candidate resolution failed: {exc}",
+            ) from exc
+
+    # ------------- 3. Preprocessing-level failures --------------------- #
+    if not result.ok:
+        dt_ms = round((time.perf_counter() - t0) * 1000, 1)
+        log.info(
+            "predict: filename=%s bytes=%d warning=%s latency_ms=%s",
+            file.filename, len(content), result.warning_code, dt_ms,
+        )
+        return JSONResponse(
+            status_code=result.status_code,
+            content={
+                **_warning_body(result),
+                "latency_ms": dt_ms,
+            },
+        )
+
+    # ------------- 4. Run the classifier on the chosen image ----------- #
     try:
+        clf = get_classifier()
+        rgb = _bgr_to_rgb(result.image)
         prediction = await asyncio.to_thread(clf.predict, rgb)
     except ClassifierError as exc:
         log.error("Classifier not available: %s", exc)
@@ -255,22 +329,27 @@ async def predict_endpoint(file: UploadFile = File(...)) -> JSONResponse:
 
     dt_ms = round((time.perf_counter() - t0) * 1000, 1)
     log.info(
-        "predict: filename=%s bytes=%d species=%s confidence=%.3f latency_ms=%s",
+        "predict: filename=%s bytes=%d species_id=%d species=%s confidence=%.2f latency_ms=%s",
         file.filename,
         len(content),
-        prediction["species"],
+        prediction["species_id"],
+        prediction["species_name"],
         prediction["confidence"],
         dt_ms,
     )
 
     return JSONResponse(
         {
+            "ok": True,
             **prediction,
-            "preprocessing": info,
             "latency_ms": dt_ms,
         }
     )
 
+
+# --------------------------------------------------------------------- #
+# Offline / batch — kept for parity with the CLI                         #
+# --------------------------------------------------------------------- #
 
 @app.post("/augment")
 async def augment_endpoint(
@@ -278,21 +357,11 @@ async def augment_endpoint(
     output_dir: str = Form(...),
     limit: int = Form(500),
 ):
-    """
-    Run the dataset augmentation step on a folder of preprocessed
-    images. **This is a batch / offline job** — the directories must be
-    visible inside the model container (mount a volume).
-
-    Args:
-        input_dir:  path to a folder of preprocessed images.
-        output_dir: where to write the augmented variants.
-        limit:      number of variants to generate.
-    """
+    """Batch dataset augmentation job (offline; volume-mounted dirs)."""
     if not os.path.isdir(input_dir):
         raise HTTPException(status_code=400, detail=f"input_dir not found: {input_dir}")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Lazy import — augmentation drags scipy/skimage which are heavy.
     from augmentation.augmentation import DatasetGenerator
     from augmentation_config import (
         DEFAULT_OPERATIONS,
