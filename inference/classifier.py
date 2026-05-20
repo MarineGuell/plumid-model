@@ -210,14 +210,102 @@ def _detect_architecture(state_keys: List[str], num_classes: int):
                 return m
             return "mobilenet_v2", _build
 
+    # ---------- DenseNet (121 / 161 / 169 / 201) ----------------------
+    # Signature: features.conv0.weight + features.norm5.weight (the final
+    # BN before the classifier) + classifier.weight as a direct Linear.
+    if (
+        "features.conv0.weight" in keys_set
+        and "features.norm5.weight" in keys_set
+        and "classifier.weight" in keys_set
+        and not any(k.startswith("classifier.1.") for k in state_keys)
+    ):
+        # Distinguish DenseNet variants by counting denselayers in
+        # denseblock3 (the longest, most discriminative block):
+        #   DenseNet121 → (6, 12, 24, 16)
+        #   DenseNet161 → (6, 12, 36, 24)
+        #   DenseNet169 → (6, 12, 32, 32)
+        #   DenseNet201 → (6, 12, 48, 32)
+        def _count_layers(block: str) -> int:
+            prefix = f"features.{block}.denselayer"
+            return len({
+                k[len(prefix):].split(".")[0]
+                for k in state_keys
+                if k.startswith(prefix)
+            })
+
+        b3 = _count_layers("denseblock3")
+        densenet_map = {
+            24: ("densenet121", tvm.densenet121),
+            36: ("densenet161", tvm.densenet161),
+            32: ("densenet169", tvm.densenet169),  # also matches 201, see below
+            48: ("densenet201", tvm.densenet201),
+        }
+        if b3 in densenet_map:
+            arch, factory = densenet_map[b3]
+            # Disambiguate 169 vs 201 — both have block3=32 vs 48
+            # already handled by the dict.
+        else:
+            # Unknown count; default to densenet121 (most common).
+            log.warning(
+                "DenseNet detected but denseblock3 layer count is %d "
+                "(expected 24/32/36/48). Defaulting to densenet121.", b3,
+            )
+            arch, factory = "densenet121", tvm.densenet121
+
+        def _build(nc: int):
+            m = factory(weights=None)
+            in_features = m.classifier.in_features
+            m.classifier = nn.Linear(in_features, nc)
+            return m
+
+        return arch, _build
+
+    # ---------- MobileNet V3 (small / large) --------------------------
+    # Signature: features.0.0.weight + classifier as a Sequential whose
+    # final Linear is at index .3 (small) or .3 (large too).
+    if any(k.startswith("features.0.0.weight") for k in state_keys) and any(
+        k.startswith("classifier.3.") for k in state_keys
+    ):
+        # Distinguish small vs large by the number of inverted-residual
+        # blocks in `features`. MobileNet V3 Small has 12 blocks total,
+        # Large has 16.
+        block_indices = {
+            int(k.split(".")[1])
+            for k in state_keys
+            if k.startswith("features.") and k.split(".")[1].isdigit()
+        }
+        n_blocks = max(block_indices) + 1 if block_indices else 0
+        if n_blocks >= 16:
+            arch, factory = "mobilenet_v3_large", tvm.mobilenet_v3_large
+        else:
+            arch, factory = "mobilenet_v3_small", tvm.mobilenet_v3_small
+
+        def _build(nc: int):
+            m = factory(weights=None)
+            in_features = m.classifier[-1].in_features
+            m.classifier[-1] = nn.Linear(in_features, nc)
+            return m
+
+        return arch, _build
+
     # ---------- Fallback ----------------------------------------------
+    # Dump the keys to help diagnose unknown architectures.
+    log.error(
+        "Cannot auto-detect architecture. State dict has %d keys. "
+        "First 40 keys:\n%s\n…\nLast 10 keys:\n%s",
+        len(state_keys),
+        "\n".join(f"  {k}" for k in state_keys[:40]),
+        "\n".join(f"  {k}" for k in state_keys[-10:]),
+    )
     raise ClassifierError(
         "Cannot auto-detect the model architecture from the state_dict. "
-        "Set the environment variable MODEL_ARCHITECTURE to one of: "
+        "See logs above for the dumped key list. "
+        "Set MODEL_ARCHITECTURE to one of: "
         "resnet18, resnet34, resnet50, resnet101, resnet152, "
         "efficientnet_b0, efficientnet_b1, efficientnet_b2, efficientnet_b3, "
-        "mobilenet_v2 — or extend `_detect_architecture` in "
-        "inference/classifier.py."
+        "mobilenet_v2, mobilenet_v3_small, mobilenet_v3_large, "
+        "densenet121, densenet161, densenet169, densenet201 — "
+        "or extend `_detect_architecture` in inference/classifier.py."
     )
 
 
@@ -243,6 +331,16 @@ def _build_explicit(arch: str, num_classes: int):
         m = tvm.mobilenet_v2(weights=None)
         m.classifier[1] = nn.Linear(m.classifier[1].in_features, num_classes)
         return m
+    if arch in {"mobilenet_v3_small", "mobilenet_v3_large"}:
+        factory = getattr(tvm, arch)
+        m = factory(weights=None)
+        m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, num_classes)
+        return m
+    if arch in {"densenet121", "densenet161", "densenet169", "densenet201"}:
+        factory = getattr(tvm, arch)
+        m = factory(weights=None)
+        m.classifier = nn.Linear(m.classifier.in_features, num_classes)
+        return m
     raise ClassifierError(f"Unknown explicit architecture: {arch}")
 
 
@@ -260,7 +358,13 @@ def _infer_num_classes(state: Dict[str, Any]) -> int:
     EfficientNet / MobileNet. The first dimension of the weight tensor
     is the number of classes.
     """
-    candidates = ("fc.weight", "classifier.1.weight", "classifier.weight")
+    candidates = (
+        "fc.weight",
+        "classifier.1.weight",
+        "classifier.3.weight",   # MobileNet V3
+        "classifier.6.weight",   # VGG
+        "classifier.weight",     # DenseNet (single Linear)
+    )
     for key in candidates:
         if key in state:
             shape = tuple(state[key].shape)
