@@ -1,8 +1,8 @@
 # Plum'ID — Model service
 
-Image preprocessing **+ inference** microservice for the Plum'ID
-feather-identification stack. Runs as a long-lived FastAPI container
-and is called by `plumid-api` over the internal network.
+Image classification microservice for the Plum'ID feather-identification
+stack. Runs as a long-lived FastAPI container and is called by
+`plumid-api` over the internal network.
 
 The trained classifier is **downloaded from HuggingFace** at first use
 (repo configured by `HF_REPO_ID`). Default repo:
@@ -10,24 +10,26 @@ The trained classifier is **downloaded from HuggingFace** at first use
 
 This repo keeps both modes available:
 
-* **HTTP service** (`service.py`) — production entry point. Single-image
-  in-memory pipeline, real model inference.
+* **HTTP service** (`service.py`) — production entry point. Decode the
+  upload, resize to 224×224, run the DenseNet classifier, return the
+  prediction. **No segmentation / denoising / preprocessing** — the
+  model handles raw photographs just fine, and a previous segmentation
+  step was producing too many false-positive multi-feather warnings.
 * **CLI** (`pipeline.py`) — the original batch tool that walks a folder,
-  preprocesses every image, and runs data augmentation. Useful for
-  building a training set.
+  preprocesses every image, and runs data augmentation. Used to build
+  the training set, not for runtime inference.
 
 ---
 
-## Pipeline stages
+## Pipeline
 
 | Stage              | What it does                                                            |
 | ------------------ | ----------------------------------------------------------------------- |
-| Segmentation       | Pulls the largest plausible feather-shaped object out of the image.      |
-| Denoising          | `cv2.fastNlMeansDenoisingColored`                                        |
-| Contrast           | CLAHE on the L channel (LAB color space)                                |
-| Padding & resize   | Square pad, resize to 224×224 (matches model input)                     |
-| **Inference**      | PyTorch classifier downloaded from HuggingFace                          |
-| Augmentation (CLI) | Rotate / blur / random noise / horizontal flip                          |
+| Decode             | JPEG/PNG/WEBP via Pillow (honors EXIF orientation), fallback to OpenCV. |
+| Resize             | Lanczos to 224×224.                                                     |
+| **Inference**      | DenseNet (or whatever architecture is in the HuggingFace `.pth`).       |
+
+That's it.
 
 ---
 
@@ -49,11 +51,10 @@ HF_REPO_ID=Azerty112/Plum_ID_V1 uvicorn service:app --host 0.0.0.0 --port 8001
 
 | Method | Path             | Purpose |
 | ------ | ---------------- | ------- |
-| GET    | `/health`        | Liveness probe (returns 200 even while the model is downloading). |
+| GET    | `/health`        | Liveness probe. |
 | GET    | `/model/status`  | Readiness + introspection: architecture, num classes, weights file, load duration, last error. |
-| POST   | `/preprocess`    | Multipart upload (`file`); returns the preprocessed PNG. Optional form fields: `skip_segmentation`, `target_size`. |
 | POST   | `/predict`       | Multipart upload (`file`); returns a JSON prediction. |
-| POST   | `/augment`       | Batch job (offline dataset generation). |
+| POST   | `/augment`       | Batch job (offline dataset generation, volume-mounted dirs). |
 
 ### Example call
 
@@ -80,40 +81,16 @@ curl -F "file=@feather.jpg" http://localhost:8001/predict | jq
 }
 ```
 
-### Preprocessing warnings (HTTP 422)
-
-The pipeline handles three preprocessing outcomes:
-
-| `warning_code`           | What happened                                                       | When the app should react |
-| ------------------------ | ------------------------------------------------------------------- | ------------------------- |
-| *(none)*                 | Exactly one feather found → prediction returned.                    | Use `species_id`.         |
-| `NO_FEATHER`             | No object resembling a feather found in the image.                  | Show the `message` to the user (advice on framing). |
-| `TOO_MANY_FEATHERS`      | Multiple objects detected; the model confirmed several are feathers. | Show the `message` and ask for a new photo. |
-| `MULTIPLE_CANDIDATES` *(internal)* | Multiple candidates detected; service is asking the model to filter. | Never reaches the API — resolved internally into one of the above. |
-
-Example warning response:
-
-```json
-{
-  "ok": false,
-  "warning_code": "NO_FEATHER",
-  "message": "Aucune plume n'a été reconnue sur l'image. Veuillez reprendre la photo en suivant ces recommandations :\n• Utilisez un fond uni et contrasté (évitez les surfaces texturées)\n• Placez la plume à plat, seule, sans main visible\n• Cadrez pour que la plume occupe entre 30 % et 75 % de l'image",
-  "latency_ms": 421.3
-}
-```
-
 ### Response fields
 
 | Field          | Type   | Description |
 | -------------- | ------ | ----------- |
-| `ok`           | bool   | `true` if a prediction was produced, `false` if preprocessing rejected the image. |
-| `species_id`   | int    | Primary key in the API's `species` table. **`0` = "Non identifié"**. |
+| `ok`           | bool   | Always `true` on a 200 response. |
+| `species_id`   | int    | Primary key in the API's `species` table. **`0` = "Non identifié"** when the model returns `Non_plumes`. |
 | `species_name` | string | Display name (matches `species.species_name` in the DB). |
 | `model_class`  | string | Raw label as emitted by the trained model. |
 | `confidence`   | float  | Confidence percent (0–100), rounded to 2 decimals. |
 | `top_k`        | list   | Top-3 candidates (same fields). |
-| `warning_code` | string | One of `NO_FEATHER`, `TOO_MANY_FEATHERS` when `ok=false`. |
-| `message`      | string | Human-readable explanation to show to the user. |
 
 ### Checking that the model loaded
 

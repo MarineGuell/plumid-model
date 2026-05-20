@@ -2,23 +2,24 @@
 service.py — Plum'ID model microservice
 =========================================
 
-FastAPI wrapper around the preprocessing + inference pipeline.
+FastAPI wrapper around the PyTorch classifier downloaded from HuggingFace.
+
+**No image preprocessing**. The image bytes are decoded, resized to 224×224,
+and passed directly to the model. The classifier handles ImageNet
+normalisation internally.
+
+Why no preprocessing? The watershed-based segmentation in the previous
+version was over-splitting single feathers into multiple candidates, which
+the classifier then labelled as feathers, producing false-positive
+TOO_MANY_FEATHERS warnings. The DenseNet model is robust enough to handle
+raw photographs without a custom segmentation step.
 
 Endpoints
 ---------
 * GET  /health        — fast liveness probe.
 * GET  /model/status  — introspection on the loaded classifier.
-* POST /preprocess    — multipart upload; returns the preprocessed PNG
-                        (segmentation + denoise + contrast + 224×224).
-* POST /predict       — multipart upload; runs the full pipeline:
-                          1. preprocess.preprocess(image_bytes)
-                          2. If multiple candidates → ask the model which
-                             ones are feathers and pick.
-                          3. If 0 or 2+ remaining → 422 with a clear
-                             warning_code + user_message.
-                          4. Otherwise → run the classifier on the
-                             selected image and return the prediction.
-* POST /augment       — batch dataset augmentation job (offline).
+* POST /predict       — multipart upload; returns the species prediction.
+* POST /augment       — batch dataset augmentation job (offline; CLI-style).
 
 Run
 ---
@@ -32,33 +33,26 @@ Environment variables (see also `inference.classifier`)
     HF_REVISION            Optional. Git ref, defaults to "main".
     HF_TOKEN               Optional. Required for private repos.
     PRELOAD_MODEL          0 | 1 (default 1).
+    MODEL_INPUT_SIZE       Optional. Square edge size in pixels. Default 224.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import threading
 import time
 from dataclasses import asdict
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import cv2 as cv
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from PIL import Image
-import io
 
 from inference import ClassifierError, get_classifier
-from preprocess import (
-    PreprocessResult,
-    WARNING_MULTIPLE_CANDIDATES,
-    WARNING_NO_FEATHER,
-    WARNING_TOO_MANY_FEATHERS,
-    preprocess,
-    resolve_candidates,
-)
 
 # --------------------------------------------------------------------- #
 # Logging                                                                #
@@ -77,41 +71,15 @@ log = logging.getLogger("plumid-model")
 
 app = FastAPI(
     title="Plum'ID — Model service",
-    version="1.2.0",
+    version="2.0.0",
     description=(
-        "Image preprocessing + inference microservice. Handles multi-feather "
-        "images by running each candidate through the classifier and "
-        "filtering out the 'Non_plumes' false positives."
+        "Simple image classification microservice. Decodes the upload, "
+        "resizes to 224×224, runs the DenseNet classifier downloaded from "
+        "HuggingFace. No fancy segmentation — just the model."
     ),
 )
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10_000_000))
-
-
-# --------------------------------------------------------------------- #
-# Helpers                                                                #
-# --------------------------------------------------------------------- #
-
-def _bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
-    return cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
-
-
-def _encode_png_bgr(img_bgr: np.ndarray) -> bytes:
-    """Encode a BGR ndarray to PNG bytes (for the /preprocess response)."""
-    rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
-    pil = Image.fromarray(rgb, mode="RGB")
-    buf = io.BytesIO()
-    pil.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
-def _warning_body(result: PreprocessResult) -> Dict[str, Any]:
-    """Build the JSON body for a preprocessing warning response."""
-    return {
-        "ok": False,
-        "warning_code": result.warning_code,
-        "message": result.user_message,
-    }
 
 
 # --------------------------------------------------------------------- #
@@ -155,6 +123,37 @@ async def _read_upload(file: UploadFile) -> bytes:
     return content
 
 
+def _decode_to_rgb_224(image_bytes: bytes, target_size: int = 224) -> np.ndarray:
+    """
+    Decode an arbitrary image (JPEG/PNG/HEIC-as-JPEG/…) and return a
+    `target_size`×`target_size` RGB ndarray (uint8). Uses Pillow first
+    for broad format support, falls back to OpenCV.
+    """
+    # First try Pillow — handles JPEG/PNG/WEBP/GIF + EXIF orientation.
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            im = im.convert("RGB")
+            # Honor EXIF orientation (most phone cameras embed it).
+            try:
+                from PIL import ImageOps
+                im = ImageOps.exif_transpose(im)
+            except Exception:  # noqa: BLE001
+                pass
+            im = im.resize((target_size, target_size), Image.LANCZOS)
+            return np.array(im, dtype=np.uint8)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Pillow decode failed (%s); falling back to OpenCV", exc)
+
+    # Fallback to OpenCV.
+    buf = np.frombuffer(image_bytes, dtype=np.uint8)
+    bgr = cv.imdecode(buf, cv.IMREAD_COLOR)
+    if bgr is None:
+        raise HTTPException(status_code=400, detail="Cannot decode image")
+    rgb = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+    rgb = cv.resize(rgb, (target_size, target_size), interpolation=cv.INTER_LANCZOS4)
+    return rgb
+
+
 # --------------------------------------------------------------------- #
 # Routes                                                                 #
 # --------------------------------------------------------------------- #
@@ -170,147 +169,37 @@ def model_status() -> Dict[str, Any]:
     return asdict(get_classifier().status)
 
 
-@app.post("/preprocess")
-async def preprocess_endpoint(file: UploadFile = File(...)):
-    """
-    Run only the preprocessing pipeline on a single image (no inference).
-
-    Returns
-    -------
-    image/png — the preprocessed image when exactly one feather is found.
-    application/json — when 0 or N candidates are found, with the
-                       appropriate warning_code and user_message.
-    """
-    content = await _read_upload(file)
-
-    t0 = time.perf_counter()
-    try:
-        result = preprocess(content)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Preprocessing failed")
-        raise HTTPException(status_code=500, detail=f"Preprocessing failed: {exc}") from exc
-
-    dt_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-    if not result.ok:
-        # Cas 0 plume ou N plumes (sans résolution par le modèle).
-        log.info(
-            "preprocess: filename=%s bytes=%d warning=%s latency_ms=%s",
-            file.filename, len(content), result.warning_code, dt_ms,
-        )
-        return JSONResponse(
-            status_code=result.status_code,
-            content={
-                **_warning_body(result),
-                "candidates_count": (
-                    len(result.candidates) if result.candidates else 0
-                ),
-                "latency_ms": dt_ms,
-            },
-        )
-
-    png = _encode_png_bgr(result.image)
-    headers = {"X-PlumID-Latency-Ms": str(dt_ms)}
-    log.info(
-        "preprocess: filename=%s bytes=%d ok latency_ms=%s",
-        file.filename, len(content), dt_ms,
-    )
-    return Response(content=png, media_type="image/png", headers=headers)
-
-
-def _resolve_with_classifier(result: PreprocessResult, clf) -> PreprocessResult:
-    """
-    Glue between preprocess.resolve_candidates and the classifier.
-
-    The `is_feather_fn` callback runs the model on each BGR candidate
-    image (224×224) and returns True for candidates the model recognises
-    as a feather (i.e. not 'Non_plumes').
-    """
-    def _is_feather(img_bgr: np.ndarray) -> bool:
-        rgb = _bgr_to_rgb(img_bgr)
-        try:
-            return clf.is_feather(rgb)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("is_feather check failed (%s); treating as non-feather", exc)
-            return False
-
-    return resolve_candidates(result, is_feather_fn=_is_feather)
-
-
 @app.post("/predict")
 async def predict_endpoint(file: UploadFile = File(...)) -> JSONResponse:
     """
-    Full pipeline: preprocess → (resolve multi-candidates) → predict.
+    Predict the bird species from a feather image.
 
-    Possible outcomes
-    -----------------
-    200 — preprocessing OK and inference succeeded.
-    422 — preprocessing failed with one of:
-            WARNING_NO_FEATHER       (no recognisable feather in the image)
-            WARNING_TOO_MANY_FEATHERS (multiple feathers detected by the model)
-    400 — invalid image bytes.
-    503 — classifier not loaded yet / failed to load.
-    500 — unexpected failure.
+    Decode → resize 224×224 → run DenseNet → return prediction.
+
+    Returns 200 with `{ok: true, species_id, species_name, model_class,
+    confidence, top_k, ...}` on success. Returns 503 if the classifier
+    is still loading. Returns 400/500 for bad input or unexpected errors.
     """
     content = await _read_upload(file)
     t0 = time.perf_counter()
 
-    # ------------- 1. Preprocess --------------------------------------- #
-    try:
-        result = preprocess(content)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Predict preprocessing failed")
-        raise HTTPException(status_code=500, detail=f"Preprocessing failed: {exc}") from exc
-
-    # ------------- 2. Multi-candidate resolution (if needed) ----------- #
-    if result.warning_code == WARNING_MULTIPLE_CANDIDATES:
-        try:
-            clf = get_classifier()
-            # Ensure model is loaded so the candidate filter has something
-            # to work with. Done in a worker thread to keep the event loop free.
-            await asyncio.to_thread(clf.ensure_loaded)
-            result = await asyncio.to_thread(
-                _resolve_with_classifier, result, clf
-            )
-        except ClassifierError as exc:
-            log.error("Classifier not available for candidate resolution: %s", exc)
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Classifier not available: {exc}. "
-                    "Check /model/status for details."
-                ),
-            ) from exc
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Candidate resolution failed")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Candidate resolution failed: {exc}",
-            ) from exc
-
-    # ------------- 3. Preprocessing-level failures --------------------- #
-    if not result.ok:
-        dt_ms = round((time.perf_counter() - t0) * 1000, 1)
-        log.info(
-            "predict: filename=%s bytes=%d warning=%s latency_ms=%s",
-            file.filename, len(content), result.warning_code, dt_ms,
-        )
-        return JSONResponse(
-            status_code=result.status_code,
-            content={
-                **_warning_body(result),
-                "latency_ms": dt_ms,
-            },
-        )
-
-    # ------------- 4. Run the classifier on the chosen image ----------- #
+    # 1. Decode + resize
     try:
         clf = get_classifier()
-        rgb = _bgr_to_rgb(result.image)
+        target_size = clf.status.input_size or int(
+            os.environ.get("MODEL_INPUT_SIZE", "224")
+        )
+        rgb = _decode_to_rgb_224(content, target_size=target_size)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Image decoding failed")
+        raise HTTPException(
+            status_code=400, detail=f"Cannot decode image: {exc}"
+        ) from exc
+
+    # 2. Inference (in a worker thread; first call is cold)
+    try:
         prediction = await asyncio.to_thread(clf.predict, rgb)
     except ClassifierError as exc:
         log.error("Classifier not available: %s", exc)
